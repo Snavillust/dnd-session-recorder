@@ -1,107 +1,108 @@
 import tkinter as tk
 from tkinter import ttk
-import threading
-from pathlib import Path
-from dnd_session_recorder.audio.capture import AudioCapture
+from dnd_session_recorder.audio.capture import AudioCaptureManager
 
-class RecordingUI:
+class RecordingWindow:
     def __init__(self, root):
         self.root = root
         self.root.title("D&D Session Recorder")
-        self.root.geometry("500x400")
+        self.audio_manager = AudioCaptureManager()
         
-        self.audio_capture = AudioCapture()
-        self.recording = False
+        # Create main frame
+        self.main_frame = ttk.Frame(root, padding="10")
+        self.main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        self.create_widgets()
+        # Input device selection
+        self.input_devices = self.audio_manager.get_input_devices()
+        self.input_device_var = tk.StringVar()
         
-    def create_widgets(self):
-        # Get available devices
-        input_devices = self.audio_capture.list_input_devices()
-        output_devices = self.audio_capture.list_output_devices()
+        ttk.Label(self.main_frame, text="Select Microphone:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.input_combo = ttk.Combobox(
+            self.main_frame, 
+            textvariable=self.input_device_var,
+            values=[device['name'] for device in self.input_devices]
+        )
+        self.input_combo.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5)
+        if self.input_devices:
+            self.input_combo.set(self.input_devices[0]['name'])
+
+        # Output device selection
+        self.output_devices = self.audio_manager.get_output_devices()
+        self.output_device_var = tk.StringVar()
         
-        self.input_device_names = [f"{name} (ID: {id})" for id, name, _ in input_devices]
-        self.output_device_names = [f"{name} (ID: {id})" for id, name, _ in output_devices]
+        ttk.Label(self.main_frame, text="Select System Audio:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.output_combo = ttk.Combobox(
+            self.main_frame, 
+            textvariable=self.output_device_var,
+            values=[device['name'] for device in self.output_devices]
+        )
+        self.output_combo.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5)
+        if self.output_devices:
+            self.output_combo.set(self.output_devices[0]['name'])
+            
+        # Status label
+        self.status_var = tk.StringVar(value="Ready to record")
+        self.status_label = ttk.Label(
+            self.main_frame, 
+            textvariable=self.status_var,
+            foreground="green"
+        )
+        self.status_label.grid(row=2, column=0, columnspan=2, pady=10)
         
-        # Device selection frame
-        device_frame = ttk.LabelFrame(self.root, text="Audio Device Selection", padding=10)
-        device_frame.pack(fill="x", padx=10, pady=5)
-        
-        # Microphone input selection
-        ttk.Label(device_frame, text="Microphone Input:").pack(anchor="w")
-        self.mic_input = ttk.Combobox(device_frame, values=self.input_device_names, width=40)
-        self.mic_input.pack(fill="x", pady=(0, 10))
-        
-        # Discord output selection
-        ttk.Label(device_frame, text="Discord Output:").pack(anchor="w")
-        self.discord_output = ttk.Combobox(device_frame, values=self.output_device_names, width=40)
-        self.discord_output.pack(fill="x", pady=(0, 10))
-        
-        # Control frame
-        control_frame = ttk.Frame(self.root, padding=10)
-        control_frame.pack(fill="x", padx=10, pady=5)
-        
-        # Recording button
+        # Record button
         self.record_button = ttk.Button(
-            control_frame, 
-            text="Start Recording", 
+            self.main_frame,
+            text="Start Recording",
             command=self.toggle_recording
         )
-        self.record_button.pack(fill="x", pady=5)
+        self.record_button.grid(row=3, column=0, columnspan=2, pady=10)
         
-        # Status label
-        self.status_label = ttk.Label(
-            control_frame, 
-            text="Ready to record", 
-            font=("Arial", 10)
-        )
-        self.status_label.pack(pady=5)
-        
-    def get_device_id(self, selected_text):
-        """Extract device ID from combobox selection."""
-        if not selected_text:
-            return None
-        return int(selected_text.split("ID: ")[1].rstrip(")"))
-        
+        # Add some padding around all widgets
+        for child in self.main_frame.winfo_children():
+            child.grid_configure(padx=5)
+
     def toggle_recording(self):
-        if not self.recording:
-            # Get selected device IDs
-            mic_device = self.mic_input.get()
-            output_device = self.discord_output.get()
-            
-            if not mic_device or not output_device:
-                self.status_label.config(text="Please select both input and output devices")
-                return
-            
-            mic_id = self.get_device_id(mic_device)
-            output_id = self.get_device_id(output_device)
-            
-            # Set devices
-            self.audio_capture.set_mic_device(mic_id)
-            self.audio_capture.set_output_device(output_id)
-            
-            # Start recording
-            self.audio_capture.start_recording()
-            self.recording = True
-            self.record_button.config(text="Stop Recording")
-            self.status_label.config(text="Recording...")
-            self.mic_input.config(state="disabled")
-            self.discord_output.config(state="disabled")
-        else:
-            # Stop recording
-            output_path = self.audio_capture.stop_recording()
-            self.recording = False
-            self.record_button.config(text="Start Recording")
-            self.status_label.config(
-                text=f"Recording saved: {output_path.name}" if output_path else "Recording failed"
+        if not self.audio_manager.recording:
+            # Get selected input device
+            selected_input_name = self.input_device_var.get()
+            selected_input = next(
+                (device for device in self.input_devices if device['name'] == selected_input_name),
+                None
             )
-            self.mic_input.config(state="normal")
-            self.discord_output.config(state="normal")
+            
+            # Get selected output device
+            selected_output_name = self.output_device_var.get()
+            selected_output = next(
+                (device for device in self.output_devices if device['name'] == selected_output_name),
+                None
+            )
+            
+            if selected_input and selected_output:
+                try:
+                    self.audio_manager.start_recording(
+                        input_device_index=selected_input['index'],
+                        output_device_index=selected_output['index']
+                    )
+                    self.status_var.set("Recording...")
+                    self.record_button.configure(text="Stop Recording")
+                    self.input_combo.configure(state="disabled")
+                    self.output_combo.configure(state="disabled")
+                except Exception as e:
+                    self.status_var.set(f"Recording error: {str(e)}")
+            else:
+                self.status_var.set("Please select both input and output devices")
+        else:
+            try:
+                self.audio_manager.stop_recording()
+                self.status_var.set("Recording saved")
+                self.record_button.configure(text="Start Recording")
+                self.input_combo.configure(state="normal")
+                self.output_combo.configure(state="normal")
+            except Exception as e:
+                self.status_var.set(f"Error stopping recording: {str(e)}")
 
-def main():
-    root = tk.Tk()
-    app = RecordingUI(root)
-    root.mainloop()
-
-if __name__ == "__main__":
-    main()
+    def __del__(self):
+        """Cleanup when the window is closed."""
+        if hasattr(self, 'audio_manager'):
+            if self.audio_manager.recording:
+                self.audio_manager.stop_recording()

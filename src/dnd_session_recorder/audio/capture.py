@@ -1,162 +1,176 @@
-import pyaudio
+import sounddevice as sd
 import numpy as np
 import wave
-from pathlib import Path
-from datetime import datetime
 import threading
-import logging
+from datetime import datetime
+import os
+import queue
 
-class AudioCapture:
-    """Handle audio recording from both microphone and system output."""
-    
+class AudioCaptureManager:
     def __init__(self):
         self.recording = False
-        self.audio_data = []
-        self.sample_rate = 44100
-        self.channels = 2
-        self.mic_device_id = None
-        self.output_device_id = None
-        self._recording_thread = None
-        self.pa = pyaudio.PyAudio()
+        self.audio_queue = queue.Queue()
+        self.system_queue = queue.Queue()
+        self.recording_thread = None
         
-        # Set up logging
-        self.logger = logging.getLogger(__name__)
-    
-    def list_input_devices(self):
-        """List all available input (microphone) devices."""
-        input_devices = []
-        for i in range(self.pa.get_device_count()):
-            device_info = self.pa.get_device_info_by_index(i)
-            if device_info['maxInputChannels'] > 0:
-                input_devices.append((
-                    i,
-                    device_info['name'],
-                    device_info['maxInputChannels']
-                ))
-        return input_devices
+    def get_input_devices(self):
+        """Returns a list of available input devices."""
+        devices = []
+        device_list = sd.query_devices()
+        for i, device in enumerate(device_list):
+            if device['max_input_channels'] > 0:  # Only input devices
+                devices.append({
+                    'index': i,
+                    'name': device['name'],
+                    'channels': device['max_input_channels']
+                })
+        return devices
 
-    def list_output_devices(self):
-        """List all available output devices with loopback support."""
-        output_devices = []
+    def get_output_devices(self):
+        """Returns a list of available output devices."""
+        devices = []
+        device_list = sd.query_devices()
+        for i, device in enumerate(device_list):
+            if device['max_output_channels'] > 0:  # Only output devices
+                devices.append({
+                    'index': i,
+                    'name': device['name'],
+                    'channels': device['max_output_channels']
+                })
+        return devices
+
+    def record_thread(self, input_device_index, output_device_index):
+        """Thread function to handle recording."""
         try:
-            wasapi_info = self.pa.get_host_api_info_by_type(pyaudio.paWASAPI)
-            wasapi_index = wasapi_info['index']
+            # Start input stream (microphone)
+            mic_stream = sd.InputStream(
+                device=input_device_index,
+                channels=1,
+                samplerate=44100,
+                callback=self.audio_callback
+            )
             
-            for i in range(self.pa.get_device_count()):
-                device_info = self.pa.get_device_info_by_index(i)
-                if device_info['hostApi'] == wasapi_index:
-                    if device_info['maxInputChannels'] == 0 and device_info['maxOutputChannels'] > 0:
-                        output_devices.append((
-                            i,
-                            f"{device_info['name']} (System Audio)",
-                            device_info['maxOutputChannels']
-                        ))
+            # Start system audio stream
+            system_stream = sd.InputStream(
+                device=output_device_index,
+                channels=2,
+                samplerate=44100,
+                callback=self.system_callback
+            )
             
-            return output_devices
+            with mic_stream, system_stream:
+                print(f"Recording started with mic ({input_device_index}) and system audio ({output_device_index})")
+                while self.recording:
+                    sd.sleep(100)
+
         except Exception as e:
-            self.logger.error(f"Error listing output devices: {e}")
-            return []
-    
-    def start_recording(self):
-        """Start recording both microphone and system audio."""
+            print(f"Error in recording thread: {e}")
+            self.recording = False
+
+    def audio_callback(self, indata, frames, time, status):
+        """Callback for audio recording."""
+        if status:
+            print(f"Audio callback status: {status}")
         if self.recording:
-            self.logger.warning("Recording already in progress")
+            self.audio_queue.put(indata.copy())
+
+    def system_callback(self, indata, frames, time, status):
+        """Callback for system audio recording."""
+        if status:
+            print(f"System audio callback status: {status}")
+        if self.recording:
+            self.system_queue.put(indata.copy())
+
+    def start_recording(self, input_device_index=None, output_device_index=None):
+        """Start recording from both microphone and system audio."""
+        if self.recording:
             return
-            
-        if self.mic_device_id is None or self.output_device_id is None:
-            raise ValueError("Both input and output devices must be selected")
-        
-        self.audio_data = []
+
+        print(f"Starting recording with input device {input_device_index} and output device {output_device_index}")
         self.recording = True
         
-        def record_thread():
-            try:
-                # Open streams for both microphone and system audio
-                mic_stream = self.pa.open(
-                    format=pyaudio.paFloat32,
-                    channels=self.channels,
-                    rate=self.sample_rate,
-                    input=True,
-                    input_device_index=self.mic_device_id,
-                    frames_per_buffer=1024
-                )
-                
-                wasapi_stream = self.pa.open(
-                    format=pyaudio.paFloat32,
-                    channels=self.channels,
-                    rate=self.sample_rate,
-                    input=True,
-                    input_device_index=self.output_device_id,
-                    frames_per_buffer=1024,
-                    as_loopback=True  # This enables WASAPI loopback
-                )
-                
-                while self.recording:
-                    mic_data = np.frombuffer(mic_stream.read(1024, exception_on_overflow=False), dtype=np.float32)
-                    system_data = np.frombuffer(wasapi_stream.read(1024, exception_on_overflow=False), dtype=np.float32)
-                    
-                    # Mix the audio (simple addition with clipping prevention)
-                    mixed_data = np.clip(mic_data + system_data, -1.0, 1.0)
-                    self.audio_data.append(mixed_data)
-                
-                mic_stream.stop_stream()
-                wasapi_stream.stop_stream()
-                mic_stream.close()
-                wasapi_stream.close()
-                
-            except Exception as e:
-                self.logger.error(f"Recording error: {e}")
-                self.recording = False
-        
-        self._recording_thread = threading.Thread(target=record_thread)
-        self._recording_thread.start()
-        self.logger.info("Recording started")
-    
+        # Clear queues
+        while not self.audio_queue.empty():
+            self.audio_queue.get()
+        while not self.system_queue.empty():
+            self.system_queue.get()
+
+        # Start recording thread
+        self.recording_thread = threading.Thread(
+            target=self.record_thread,
+            args=(input_device_index, output_device_index)
+        )
+        self.recording_thread.start()
+
     def stop_recording(self):
         """Stop recording and save the audio file."""
         if not self.recording:
-            self.logger.warning("No recording in progress")
-            return None
-        
+            return
+
+        print("Stopping recording")
         self.recording = False
-        if self._recording_thread:
-            self._recording_thread.join()
         
-        if not self.audio_data:
-            self.logger.warning("No audio data captured")
-            return None
+        if self.recording_thread:
+            self.recording_thread.join()
+
+        # Collect recorded audio data
+        mic_frames = []
+        system_frames = []
         
-        # Combine all audio chunks
-        audio_data = np.concatenate(self.audio_data, axis=0)
+        while not self.audio_queue.empty():
+            mic_frames.append(self.audio_queue.get())
+            
+        while not self.system_queue.empty():
+            system_frames.append(self.system_queue.get())
+
+        # Mix audio if we have both streams
+        if mic_frames and system_frames:
+            mic_audio = np.concatenate(mic_frames)
+            system_audio = np.concatenate(system_frames)
+            
+            # Convert system audio to mono if it's stereo
+            if len(system_audio.shape) > 1 and system_audio.shape[1] > 1:
+                system_audio = np.mean(system_audio, axis=1)
+            
+            # Ensure both arrays are the same length
+            min_length = min(len(mic_audio), len(system_audio))
+            mic_audio = mic_audio[:min_length]
+            system_audio = system_audio[:min_length]
+            
+            # Mix the audio (adjust mixing ratio as needed)
+            mixed_audio = 0.7 * mic_audio + 0.3 * system_audio
+            print("Mixed audio with both microphone and system audio")
+        else:
+            # If we only have microphone audio
+            mixed_audio = np.concatenate(mic_frames) if mic_frames else np.array([])
+            print("Only microphone audio was captured")
+
+        # Save the mixed audio
+        if len(mixed_audio) > 0:
+            self._save_audio(mixed_audio)
+            print("Saved mixed audio file")
+
+    def _save_audio(self, audio_data):
+        """Save the recorded audio to a WAV file."""
+        # Create recordings directory if it doesn't exist
+        os.makedirs('recordings', exist_ok=True)
         
-        # Create filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = Path(f"recordings/session_{timestamp}.wav")
-        output_path.parent.mkdir(exist_ok=True)
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'recordings/session_{timestamp}.wav'
         
-        # Save to WAV file
-        with wave.open(str(output_path), 'wb') as wav_file:
-            wav_file.setnchannels(self.channels)
-            wav_file.setsampwidth(2)  # 16-bit audio
-            wav_file.setframerate(self.sample_rate)
-            wav_file.writeframes((audio_data * 32767).astype(np.int16).tobytes())
+        # Convert float32 to int16
+        audio_data = np.int16(audio_data * 32767)
         
-        self.logger.info(f"Recording saved to: {output_path}")
-        return output_path
-    
-    def is_recording(self):
-        """Check if currently recording."""
-        return self.recording
-    
-    def set_mic_device(self, device_id):
-        """Set the microphone device."""
-        self.mic_device_id = device_id
-        
-    def set_output_device(self, device_id):
-        """Set the output device."""
-        self.output_device_id = device_id
-        
+        # Save the file
+        with wave.open(filename, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(44100)
+            wf.writeframes(audio_data.tobytes())
+        print(f"Saved audio to: {filename}")
+
     def __del__(self):
-        """Cleanup PyAudio."""
-        if hasattr(self, 'pa'):
-            self.pa.terminate()
+        """Cleanup when the object is destroyed."""
+        if self.recording:
+            self.stop_recording()
