@@ -1,0 +1,5 @@
+faster-whisper
+pyannote-audio
+librosa
+sounddevice
+pytest
